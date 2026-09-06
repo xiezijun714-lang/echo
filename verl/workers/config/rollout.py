@@ -65,6 +65,7 @@ class MultiTurnConfig(BaseConfig):
     # SUPO (Summarization augmented Policy Optimization) configuration
     enable_summarization: bool = False  # Enable SUPO summarization mechanism
     max_summary_rounds: int = 2  # Maximum summarization rounds S
+    train_summary_tokens: bool = True  # Include generated summary tokens in the policy loss.
     working_context_length: int = 8192  # Working context length threshold L
     summary_max_chars: int = 3072  # Maximum characters retained from generated summaries
     summary_instruction: str = (
@@ -113,6 +114,7 @@ class MultiTurnConfig(BaseConfig):
         "</selection>"
     )
     selection_max_turns: int = 8  # Max model-selected turns before automatic recent-turn retention. <=0 disables cap.
+    selection_max_new_tokens: int = 1024  # Decoder budget reserved for each ECHO selection generation.
     echo_recent_turns: int = 3  # Always retain the latest K turns in addition to selected turns.
     semantic_selection_topk: int = 5  # Embedding-selected turns for semantic_selection. <=0 keeps recent turns only.
     semantic_selection_full_observation: bool = False  # Use raw tool observations instead of sum_last_turn findings.

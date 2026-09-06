@@ -341,10 +341,51 @@ class AgentLoopBase(ABC):
             )
             prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
         else:
+            # Text tokenizers cannot encode structured content blocks. Tool
+            # implementations normally return strings, but a malformed or
+            # third-party response can leave a list/dict in ``content`` and
+            # otherwise kill the whole rollout with a low-level tokenizer
+            # TypeError. Preserve text-bearing parts and coerce the message
+            # locally without mutating the agent history.
+            normalized_messages = []
+            coerced_content = []
+            for message_index, message in enumerate(messages):
+                if not isinstance(message, dict):
+                    normalized_messages.append({"role": "user", "content": str(message)})
+                    coerced_content.append((message_index, "<message>", type(message).__name__))
+                    continue
+                normalized_message = dict(message)
+                content = normalized_message.get("content")
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            text = part.get("text")
+                            if text is None:
+                                text = part.get("content")
+                            if text is not None:
+                                text_parts.append(str(text))
+                        elif part is not None:
+                            text_parts.append(str(part))
+                    normalized_message["content"] = "\n".join(text_parts)
+                    coerced_content.append((message_index, message.get("role", "<unknown>"), "list"))
+                elif content is None:
+                    normalized_message["content"] = ""
+                    coerced_content.append((message_index, message.get("role", "<unknown>"), "None"))
+                elif not isinstance(content, str):
+                    normalized_message["content"] = str(content)
+                    coerced_content.append((message_index, message.get("role", "<unknown>"), type(content).__name__))
+                normalized_messages.append(normalized_message)
+
+            if coerced_content:
+                logger.warning(
+                    "Coerced non-text chat message content before tokenization: %s",
+                    coerced_content[:8],
+                )
             tokenized_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.tokenizer.apply_chat_template(
-                    messages,
+                    normalized_messages,
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
@@ -903,9 +944,11 @@ class AgentLoopWorker:
             "overlong",
             "echo_selected_traj_indices",
             "echo_selected_turn_ids",
+            "echo_memory_graph",
             "echo_response_turn_ids",
             "echo_response_finding_turn_ids",
             "echo_response_selection_mask",
+            "echo_diagnostics",
             "is_padding",
             "reward_model",
             "data_source",

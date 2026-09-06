@@ -478,6 +478,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if batch is None:
                 raise TrainingStopException("Training terminated: queue returned None")
             self._collect_metrics_from_samples(batch, metrics)
+            if self._is_supo:
+                # The fully-async loop bypasses RayPPOTrainer.fit(), so its
+                # ECHO diagnostics must be collected here after queue assembly.
+                metrics.update(self._supo_diagnostic_metrics(batch))
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
 

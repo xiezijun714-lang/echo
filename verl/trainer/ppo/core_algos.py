@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import logging
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -50,6 +51,7 @@ PolicyLossFn = Callable[
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
 ECHO_TURN_POLICY_LOSS_MODES = {"echo_turn_gspo", "echo_turn", "echo-turn"}
 _ECHO_CREDIT_EMPTY_TARGET_WARNED = False
+logger = logging.getLogger(__name__)
 
 
 def is_echo_turn_policy_loss(name: str) -> bool:
@@ -377,6 +379,8 @@ def compute_supo_advantage(
     echo_response_turn_ids: np.ndarray | None = None,
     echo_response_finding_turn_ids: np.ndarray | None = None,
     echo_response_selection_mask: np.ndarray | None = None,
+    echo_memory_graph: np.ndarray | None = None,
+    echo_graph_metrics: dict[str, float] | None = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -411,18 +415,50 @@ def compute_supo_advantage(
             if echo_response_finding_turn_ids is not None else None
         response_selection_mask_arr = np.asarray(echo_response_selection_mask, dtype=object) \
             if echo_response_selection_mask is not None else None
+        memory_graph_arr = np.asarray(echo_memory_graph, dtype=object) \
+            if echo_memory_graph is not None else None
         credit_mode = str(getattr(config, "echo_credit_method", "none") or "none").lower()
-        valid_credit_modes = {"none", "token", "traj"}
+        valid_credit_modes = {"none", "token", "traj", "graph"}
         if credit_mode not in valid_credit_modes:
             raise ValueError(
                 f"Invalid echo_credit_method={credit_mode!r}. "
                 f"Expected one of {sorted(valid_credit_modes)}."
             )
-        penalty_ratio_config = getattr(config, "echo_credit_penalty_ratio", None)
-        use_penalty_ratio = penalty_ratio_config is not None and credit_mode != "none"
-        penalty_ratio = float(penalty_ratio_config) if use_penalty_ratio else 1.0
-        if not 0.0 <= penalty_ratio <= 1.0:
-            raise ValueError(f"echo_credit_penalty_ratio must be in [0, 1], got {penalty_ratio}")
+        neg_ratio_config = getattr(config, "echo_neg_penalty_ratio", None)
+        neg_penalty_ratio = float(neg_ratio_config or 0.0)
+        if not 0.0 <= neg_penalty_ratio <= 1.0:
+            raise ValueError(
+                f"echo_neg_penalty_ratio must be in [0, 1], got {neg_penalty_ratio}"
+            )
+        # ``echo_graph_gamma`` is read only for version-1 graph snapshots
+        # produced before typed turn edges existed. New v2 graphs use the two
+        # explicit edge discounts below.
+        legacy_graph_gamma = float(getattr(config, "echo_graph_gamma", 0.9) or 0.0)
+        graph_gamma_turn = float(getattr(config, "echo_graph_gamma_turn", 1.0) or 0.0)
+        graph_gamma_segment = float(getattr(config, "echo_graph_gamma_segment", legacy_graph_gamma) or 0.0)
+        graph_clip_config = getattr(config, "echo_graph_clip_max", 1.0)
+        if isinstance(graph_clip_config, str) and graph_clip_config.strip().lower() in {
+            "none", "null", "off", "no-clip"
+        }:
+            graph_clip_max = None
+        else:
+            graph_clip_max = None if graph_clip_config is None else float(graph_clip_config)
+        graph_aggregation = str(getattr(config, "echo_graph_aggregation", "max") or "max").lower()
+        if not 0.0 <= graph_gamma_turn <= 1.0:
+            raise ValueError(f"echo_graph_gamma_turn must be in [0, 1], got {graph_gamma_turn}")
+        if not 0.0 <= graph_gamma_segment <= 1.0:
+            raise ValueError(f"echo_graph_gamma_segment must be in [0, 1], got {graph_gamma_segment}")
+        if graph_clip_max is not None and graph_clip_max <= 0.0:
+            raise ValueError(f"echo_graph_clip_max must be positive or null, got {graph_clip_max}")
+        if graph_aggregation not in {"max", "sum"}:
+            raise ValueError(
+                f"echo_graph_aggregation must be one of ['max', 'sum'], got {graph_aggregation!r}"
+            )
+        trace_metadata_available = (
+            selected_traj_arr is not None
+            or selected_turn_arr is not None
+            or response_selection_mask_arr is not None
+        )
         global _ECHO_CREDIT_EMPTY_TARGET_WARNED
         if (
             credit_mode != "none"
@@ -431,7 +467,6 @@ def compute_supo_advantage(
             and selected_turn_arr is None
             and response_selection_mask_arr is None
         ):
-            logger = __import__("logging").getLogger(__name__)
             logger.warning(
                 "echo_credit_method=%s but no echo selected-turn/traj or selection-mask metadata was found; "
                 "advantages will fall back to all valid response tokens.",
@@ -442,6 +477,11 @@ def compute_supo_advantage(
         rollout_to_reward = {}
         rollout_to_selected_trajs = {}
         rollout_to_selected_turns = {}
+        rollout_to_graph_weights = {}
+        rollout_to_selection_weights = {}
+        rollout_to_graph_versions = {}
+        rollout_to_graph_diagnostics = {}
+        rollout_graph_valid = {}
         rollout_is_overlong = set()
         uid_to_rids = defaultdict(set)
 
@@ -472,6 +512,371 @@ def compute_supo_advantage(
                     mask_list = mask_list + [0] * (response_mask.shape[1] - len(mask_list))
             return torch.tensor(mask_list[: response_mask.shape[1]], device=response_mask.device).bool()
 
+        def _unwrap_object(value):
+            """Extract a Python object from numpy object-array wrappers."""
+            while isinstance(value, np.ndarray) and value.ndim == 0:
+                value = value.item()
+            return value
+
+        def _selection_graph_credit_weights(
+            graph,
+        ) -> tuple[dict[int, float], dict[str, float]] | None:
+            """Validate and score the original selection-level ECHO graph.
+
+            The graph stores untyped parent turn IDs.  ``outcome_parent_turn_ids``
+            is an optional synthetic terminal node; when it is absent, the
+            model-selected turns are the credit roots.  Credit is propagated
+            backwards through the serialized parent links with one shared
+            gamma and either max or sum aggregation.
+            """
+            graph = _unwrap_object(graph)
+            if not isinstance(graph, dict):
+                return None
+            if graph.get("version") != 1:
+                logger.warning(
+                    "Unsupported ECHO graph version=%r; falling back to token credit",
+                    graph.get("version"),
+                )
+                return None
+            nodes_raw = _unwrap_object(graph.get("nodes"))
+            if not isinstance(nodes_raw, (list, tuple)):
+                return None
+
+            def _to_int_list(value) -> list[int]:
+                value = _unwrap_object(value)
+                if value is None:
+                    return []
+                if isinstance(value, np.ndarray):
+                    value = value.tolist()
+                if not isinstance(value, (list, tuple, set)):
+                    value = [value]
+                result = []
+                for item in value:
+                    try:
+                        result.append(int(item))
+                    except (TypeError, ValueError):
+                        continue
+                return result
+
+            has_outcome_parents = "outcome_parent_turn_ids" in graph
+            raw_outcome_parent_ids = set(_to_int_list(graph.get("outcome_parent_turn_ids")))
+            raw_final_ids = set(_to_int_list(graph.get("final_model_selected_turn_ids")))
+
+            parents_by_id: dict[object, set[int]] = {}
+            known_ids: set[int] = set()
+            for raw_node in nodes_raw:
+                raw_node = _unwrap_object(raw_node)
+                if not isinstance(raw_node, dict):
+                    continue
+                raw_id = raw_node.get("turn_id")
+                try:
+                    turn_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if turn_id in known_ids:
+                    logger.warning("ECHO graph has duplicate turn_id=%s; ignoring duplicate node", turn_id)
+                    continue
+                known_ids.add(turn_id)
+                parents_by_id[turn_id] = set(_to_int_list(raw_node.get("parent_turn_ids")))
+
+            empty_diagnostics = {
+                "active_node_count": 0.0,
+                "clipped_node_count": 0.0,
+                "branch_parent_count": 0.0,
+                "branch_parent_weight_sum": 0.0,
+            }
+            if not known_ids:
+                return ({}, empty_diagnostics) if not raw_final_ids else None
+
+            for turn_id, parent_ids in parents_by_id.items():
+                missing = parent_ids - known_ids
+                if missing:
+                    logger.warning(
+                        "ECHO graph node %s references missing parents %s; ignoring those edges",
+                        turn_id,
+                        sorted(missing),
+                    )
+                    parent_ids.intersection_update(known_ids)
+                if turn_id in parent_ids:
+                    logger.warning("ECHO graph self-edge at turn_id=%s; ignoring edge", turn_id)
+                    parent_ids.discard(turn_id)
+
+            outcome_id = "__echo_outcome__"
+            if has_outcome_parents:
+                missing_outcome = raw_outcome_parent_ids - known_ids
+                if missing_outcome:
+                    logger.warning(
+                        "ECHO outcome references missing parent turns %s; ignoring those edges",
+                        sorted(missing_outcome),
+                    )
+                outcome_parent_ids = raw_outcome_parent_ids & known_ids
+                if not outcome_parent_ids:
+                    return ({}, empty_diagnostics)
+                parents_by_id[outcome_id] = outcome_parent_ids
+
+            all_ids: set[object] = set(known_ids)
+            all_ids.add(outcome_id)
+            children_by_id: dict[object, set[object]] = {node_id: set() for node_id in all_ids}
+            for child_id, parent_ids in parents_by_id.items():
+                for parent_id in parent_ids:
+                    children_by_id[parent_id].add(child_id)
+
+            visit_state: dict[object, int] = {}
+
+            def _has_cycle(node_id: object) -> bool:
+                state = visit_state.get(node_id, 0)
+                if state == 1:
+                    return True
+                if state == 2:
+                    return False
+                visit_state[node_id] = 1
+                if any(_has_cycle(child_id) for child_id in children_by_id[node_id]):
+                    return True
+                visit_state[node_id] = 2
+                return False
+
+            if any(_has_cycle(node_id) for node_id in all_ids):
+                logger.warning("ECHO graph contains a cycle; falling back to token credit for this rollout")
+                return None
+
+            if has_outcome_parents:
+                final_ids: set[object] = {outcome_id}
+            else:
+                missing_final = raw_final_ids - known_ids
+                if missing_final:
+                    logger.warning(
+                        "ECHO graph references missing final selected turns %s; ignoring those roots",
+                        sorted(missing_final),
+                    )
+                final_ids = raw_final_ids & known_ids
+                if not final_ids:
+                    return ({}, empty_diagnostics) if not raw_final_ids else None
+
+            reachable: set[object] = set()
+
+            def _visit_ancestors(node_id: object):
+                if node_id in reachable:
+                    return
+                reachable.add(node_id)
+                for parent_id in parents_by_id.get(node_id, set()):
+                    _visit_ancestors(parent_id)
+
+            for final_id in final_ids:
+                _visit_ancestors(final_id)
+
+            credit_cache: dict[object, float] = {}
+            raw_credit_cache: dict[object, float] = {}
+            active_path: set[object] = set()
+
+            def _credit(node_id: object) -> float:
+                if node_id in credit_cache:
+                    return credit_cache[node_id]
+                if node_id in active_path:
+                    raise ValueError("cycle while computing ECHO graph credit")
+                active_path.add(node_id)
+                value = 1.0 if node_id in final_ids else 0.0
+                child_credits = [
+                    _credit(child_id)
+                    for child_id in children_by_id[node_id]
+                    if child_id in reachable
+                ]
+                if child_credits:
+                    downstream_credit = (
+                        max(child_credits) if graph_aggregation == "max" else sum(child_credits)
+                    )
+                    value += graph_gamma_segment * downstream_credit
+                active_path.remove(node_id)
+                raw_credit_cache[node_id] = value
+                value = min(graph_clip_max, value) if graph_clip_max is not None else value
+                credit_cache[node_id] = value
+                return value
+
+            weights = {
+                int(node_id): _credit(node_id)
+                for node_id in reachable
+                if node_id != outcome_id
+            }
+            active_ids = [node_id for node_id, value in weights.items() if value > 0.0]
+            clipped_ids = [
+                node_id
+                for node_id in active_ids
+                if graph_clip_max is not None and raw_credit_cache[node_id] > graph_clip_max
+            ]
+            branch_ids = [
+                node_id
+                for node_id in active_ids
+                if len({child_id for child_id in children_by_id[node_id] if child_id in reachable}) > 1
+            ]
+            diagnostics = {
+                "active_node_count": float(len(active_ids)),
+                "clipped_node_count": float(len(clipped_ids)),
+                "branch_parent_count": float(len(branch_ids)),
+                "branch_parent_weight_sum": float(sum(weights[node_id] for node_id in branch_ids)),
+            }
+            return weights, diagnostics
+
+        def _turn_graph_credit_weights(
+            graph,
+        ) -> tuple[dict[int, float], dict[int, float], dict[str, float]] | None:
+            """Score the sparse typed turn DAG with separate edge discounts.
+
+            ``turn`` edges are local consecutive-turn provenance and
+            ``selection`` edges cross a context reconstruction boundary. The
+            selection action itself is represented by ``selection_events`` and
+            receives the credit of the first downstream turn separately.
+            """
+            graph = _unwrap_object(graph)
+            if not isinstance(graph, dict) or graph.get("version") != 2:
+                return None
+            nodes_raw = _unwrap_object(graph.get("nodes"))
+            if not isinstance(nodes_raw, (list, tuple)):
+                return None
+
+            def _edges(value) -> list[tuple[int, str]]:
+                value = _unwrap_object(value)
+                if not isinstance(value, (list, tuple)):
+                    return []
+                result, seen = [], set()
+                for raw in value:
+                    raw = _unwrap_object(raw)
+                    if not isinstance(raw, dict):
+                        continue
+                    try:
+                        parent_id = int(raw.get("turn_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    edge_type = str(raw.get("type", "") or "").lower()
+                    edge = (parent_id, edge_type)
+                    if edge_type in {"turn", "selection"} and edge not in seen:
+                        result.append(edge)
+                        seen.add(edge)
+                return result
+
+            parents_by_id: dict[object, list[tuple[int, str]]] = {}
+            known_ids: set[int] = set()
+            for raw_node in nodes_raw:
+                raw_node = _unwrap_object(raw_node)
+                if not isinstance(raw_node, dict):
+                    continue
+                try:
+                    turn_id = int(raw_node.get("turn_id"))
+                except (TypeError, ValueError):
+                    continue
+                if turn_id in known_ids:
+                    continue
+                known_ids.add(turn_id)
+                parents_by_id[turn_id] = [
+                    (parent_id, edge_type)
+                    for parent_id, edge_type in _edges(raw_node.get("parent_edges"))
+                    if parent_id != turn_id
+                ]
+
+            # Remove references to nodes that were not serialized.
+            for turn_id, edges in list(parents_by_id.items()):
+                parents_by_id[turn_id] = [(p, t) for p, t in edges if p in known_ids]
+            outcome_edges = [(p, t) for p, t in _edges(graph.get("outcome_parent_edges")) if p in known_ids]
+            if not known_ids or not outcome_edges:
+                return ({}, {}, {"active_node_count": 0.0, "clipped_node_count": 0.0,
+                                  "branch_parent_count": 0.0, "branch_parent_weight_sum": 0.0})
+
+            outcome_id = "__echo_outcome__"
+            parents_by_id[outcome_id] = outcome_edges
+            all_ids = set(known_ids) | {outcome_id}
+            children_by_id: dict[object, list[tuple[object, str]]] = {node_id: [] for node_id in all_ids}
+            for child_id, edges in parents_by_id.items():
+                for parent_id, edge_type in edges:
+                    if parent_id in children_by_id:
+                        children_by_id[parent_id].append((child_id, edge_type))
+
+            state: dict[object, int] = {}
+
+            def _cycle(node_id: object) -> bool:
+                if state.get(node_id, 0) == 1:
+                    return True
+                if state.get(node_id, 0) == 2:
+                    return False
+                state[node_id] = 1
+                if any(_cycle(child_id) for child_id, _ in children_by_id[node_id]):
+                    return True
+                state[node_id] = 2
+                return False
+
+            if any(_cycle(node_id) for node_id in all_ids):
+                logger.warning("ECHO typed graph contains a cycle; falling back to token credit")
+                return None
+
+            reachable: set[object] = set()
+
+            def _ancestors(node_id: object):
+                if node_id in reachable:
+                    return
+                reachable.add(node_id)
+                for parent_id, _ in parents_by_id.get(node_id, []):
+                    _ancestors(parent_id)
+
+            _ancestors(outcome_id)
+            cache: dict[object, float] = {}
+            raw_cache: dict[object, float] = {}
+
+            def _credit(node_id: object) -> float:
+                if node_id in cache:
+                    return cache[node_id]
+                if node_id == outcome_id:
+                    raw_value = 1.0
+                else:
+                    contributions = [
+                        (graph_gamma_turn if edge_type == "turn" else graph_gamma_segment)
+                        * _credit(child_id)
+                        for child_id, edge_type in children_by_id[node_id]
+                        if child_id in reachable
+                    ]
+                    raw_value = (
+                        max(contributions)
+                        if graph_aggregation == "max" and contributions
+                        else sum(contributions)
+                    )
+                raw_cache[node_id] = raw_value
+                value = min(graph_clip_max, raw_value) if graph_clip_max is not None else raw_value
+                cache[node_id] = value
+                return value
+
+            weights = {int(node_id): _credit(node_id) for node_id in reachable if node_id != outcome_id}
+            active_ids = [node_id for node_id, value in weights.items() if value > 0.0]
+            clipped_ids = [node_id for node_id in active_ids if graph_clip_max is not None and raw_cache[node_id] > graph_clip_max]
+            branch_ids = [
+                node_id for node_id in active_ids
+                if len({child_id for child_id, _ in children_by_id[node_id] if child_id in reachable}) > 1
+            ]
+            diagnostics = {
+                "active_node_count": float(len(active_ids)),
+                "clipped_node_count": float(len(clipped_ids)),
+                "branch_parent_count": float(len(branch_ids)),
+                "branch_parent_weight_sum": float(sum(weights[node_id] for node_id in branch_ids)),
+            }
+
+            selection_weights: dict[int, float] = {}
+            events = _unwrap_object(graph.get("selection_events"))
+            if isinstance(events, (list, tuple)):
+                for raw_event in events:
+                    raw_event = _unwrap_object(raw_event)
+                    if not isinstance(raw_event, dict):
+                        continue
+                    try:
+                        source_traj_idx = int(raw_event.get("source_traj_idx"))
+                    except (TypeError, ValueError):
+                        continue
+                    downstream = raw_event.get("downstream_turn_id")
+                    if downstream == "outcome":
+                        value = 1.0
+                    else:
+                        try:
+                            downstream = int(downstream)
+                        except (TypeError, ValueError):
+                            continue
+                        value = _credit(downstream) if downstream in reachable else 0.0
+                    selection_weights[source_traj_idx] = max(selection_weights.get(source_traj_idx, 0.0), value)
+            return weights, selection_weights, diagnostics
+
         for i in range(bs):
             rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
             uid = uid_arr[i] if isinstance(uid_arr[i], str) else int(uid_arr[i])
@@ -484,6 +889,23 @@ def compute_supo_advantage(
                     rollout_to_selected_trajs[rid] = _to_int_set(selected_traj_arr[i])
                 if selected_turn_arr is not None:
                     rollout_to_selected_turns[rid] = _to_int_set(selected_turn_arr[i])
+                if memory_graph_arr is not None:
+                    graph_obj = _unwrap_object(memory_graph_arr[i])
+                    if isinstance(graph_obj, dict) and graph_obj.get("version") == 2:
+                        graph_result = _turn_graph_credit_weights(graph_obj)
+                    else:
+                        graph_result = _selection_graph_credit_weights(graph_obj)
+                    if graph_result is not None:
+                        if len(graph_result) == 3:
+                            graph_weights, selection_weights, graph_diagnostics = graph_result
+                        else:
+                            graph_weights, graph_diagnostics = graph_result
+                            selection_weights = {}
+                        rollout_to_graph_weights[rid] = graph_weights
+                        rollout_to_selection_weights[rid] = selection_weights
+                        rollout_to_graph_versions[rid] = graph_obj.get("version") if isinstance(graph_obj, dict) else None
+                        rollout_to_graph_diagnostics[rid] = graph_diagnostics
+                        rollout_graph_valid[rid] = True
 
         # Pass 2: compute GRPO-style advantages within each uid group.
         rollout_to_advantage = {}
@@ -544,25 +966,89 @@ def compute_supo_advantage(
             rid = rid_arr[i] if isinstance(rid_arr[i], str) else int(rid_arr[i])
             adv = rollout_to_advantage.get(rid, 0.0)
             if credit_mode != "none":
-                # A selected trace is reliable evidence only for rollouts that
-                # outperform their group baseline. Sparse ECHO credit therefore
-                # routes the positive part of the group-relative advantage.
+                if adv < 0.0:
+                    # A failed rollout has no trustworthy causal turn label.
+                    # Apply its signed signal densely to all trainable response
+                    # tokens, with an explicit scale separate from positive
+                    # sparse-credit routing.
+                    advantages[i, :] = (
+                        adv * neg_penalty_ratio * response_mask[i, :].float()
+                    )
+                    continue
+                # A selected trace is reliable only for rollouts that
+                # outperform their group baseline. Sparse ECHO credit routes
+                # the positive part of the group-relative advantage.
                 adv = max(adv, 0.0)
             credit_mask = torch.zeros_like(response_mask[i, :], dtype=torch.bool)
             rollout_has_credit_target = False
 
-            if credit_mode != "none" and is_final_arr[i]:
+            if credit_mode == "graph":
+                graph_weights = rollout_to_graph_weights.get(rid)
+                graph_is_valid = rollout_graph_valid.get(rid, False)
+                if graph_is_valid:
+                    # The currently generated final segment remains fully
+                    # trainable; graph weights apply to historical Turn Memory.
+                    weight_vec = torch.zeros_like(response_mask[i, :], dtype=torch.float32)
+                    if is_final_arr[i]:
+                        weight_vec[response_mask[i, :].bool()] = 1.0
+                        rollout_has_credit_target = True
+                    if response_turn_arr is not None:
+                        turn_ids_tensor = _to_turn_tensor(response_turn_arr[i])
+                        finding_turn_ids_tensor = _to_turn_tensor(
+                            response_finding_turn_arr[i] if response_finding_turn_arr is not None else None
+                        )
+                        for turn_id, turn_credit in graph_weights.items():
+                            if not is_final_arr[i]:
+                                turn_mask = turn_ids_tensor.eq(int(turn_id)) & response_mask[i, :].bool()
+                            else:
+                                turn_mask = torch.zeros_like(response_mask[i, :], dtype=torch.bool)
+                            finding_mask = finding_turn_ids_tensor.eq(int(turn_id)) & response_mask[i, :].bool()
+                            if turn_mask.any():
+                                weight_vec[turn_mask] = torch.maximum(
+                                    weight_vec[turn_mask],
+                                    torch.full_like(weight_vec[turn_mask], float(turn_credit)),
+                                )
+                                rollout_has_credit_target = True
+                            if finding_mask.any():
+                                # A summary is the source turn's compressed
+                                # observation, so it inherits the full turn
+                                # credit rather than a separately tunable floor.
+                                weight_vec[finding_mask] = float(turn_credit)
+                                rollout_has_credit_target = True
+                    if response_selection_mask_arr is not None:
+                        selection_mask_tensor = _to_bool_tensor(response_selection_mask_arr[i])
+                        selection_mask_tensor &= response_mask[i, :].bool()
+                        if selection_mask_tensor.any():
+                            # Selection tokens are outside the graph. In v2,
+                            # align them to the first downstream turn; v1
+                            # retains the historical unit selector weight.
+                            selection_credit = 1.0
+                            if traj_idx_arr is not None:
+                                traj_idx_i = traj_idx_arr[i] if isinstance(traj_idx_arr[i], str) else int(traj_idx_arr[i])
+                                default_credit = 0.0 if rollout_to_graph_versions.get(rid) == 2 else 1.0
+                                selection_credit = rollout_to_selection_weights.get(rid, {}).get(traj_idx_i, default_credit)
+                            weight_vec[selection_mask_tensor] = float(selection_credit)
+                            rollout_has_credit_target = True
+                    advantages[i, :] = adv * response_mask[i, :].float() * weight_vec
+                    continue
+                # Missing/invalid graph metadata falls through to the old
+                # token-credit implementation for this rollout.
+                credit_mode_for_row = "token"
+            else:
+                credit_mode_for_row = credit_mode
+
+            if credit_mode_for_row != "none" and is_final_arr[i]:
                 credit_mask |= response_mask[i, :].bool()
                 rollout_has_credit_target = True
 
-            if credit_mode == "traj" and traj_idx_arr is not None:
+            if credit_mode_for_row == "traj" and traj_idx_arr is not None:
                 traj_idx_i = traj_idx_arr[i] if isinstance(traj_idx_arr[i], str) else int(traj_idx_arr[i])
                 selected_trajs = rollout_to_selected_trajs.get(rid, set())
                 rollout_has_credit_target = rollout_has_credit_target or bool(selected_trajs)
                 if traj_idx_i in selected_trajs:
                     credit_mask |= response_mask[i, :].bool()
 
-            if credit_mode == "token" and response_turn_arr is not None:
+            if credit_mode_for_row == "token" and response_turn_arr is not None:
                 selected_turns = rollout_to_selected_turns.get(rid, set())
                 rollout_has_credit_target = rollout_has_credit_target or bool(selected_turns)
                 if selected_turns:
@@ -574,20 +1060,50 @@ def compute_supo_advantage(
                         credit_mask |= turn_ids_tensor.eq(int(turn_id)) | finding_turn_ids_tensor.eq(int(turn_id))
                     credit_mask &= response_mask[i, :].bool()
 
-            if credit_mode == "token" and response_selection_mask_arr is not None:
+            if credit_mode_for_row == "token" and response_selection_mask_arr is not None:
                 selection_mask_tensor = _to_bool_tensor(response_selection_mask_arr[i])
                 credit_mask |= selection_mask_tensor & response_mask[i, :].bool()
                 rollout_has_credit_target = rollout_has_credit_target or bool(selection_mask_tensor.any().item())
 
-            if use_penalty_ratio and rollout_has_credit_target:
-                weight_vec = torch.full_like(response_mask[i, :], penalty_ratio, dtype=torch.float32)
-                weight_vec[credit_mask] = 1.0
-                advantages[i, :] = adv * response_mask[i, :].float() * weight_vec
+            # ECHO metadata is present for every serialized segment, including
+            # an explicit empty final selection. In that case non-final rows
+            # must not silently fall back to dense credit: only the final
+            # segment (and any selected trace tokens) are eligible.
+            if credit_mode_for_row != "none" and trace_metadata_available:
+                advantages[i, :] = adv * response_mask[i, :].float() * credit_mask.float()
                 continue
 
             advantages[i, :] = adv * response_mask[i, :].float()
 
         advantages = advantages.to(token_level_rewards.dtype)
+        if echo_graph_metrics is not None:
+            valid_advantages = advantages[response_mask.bool()]
+            echo_graph_metrics["signed_advantage_mean"] = (
+                float(valid_advantages.float().mean().item()) if valid_advantages.numel() else 0.0
+            )
+            positive_graph_rids = [
+                rid
+                for rid, adv in rollout_to_advantage.items()
+                if adv > 0.0 and rollout_graph_valid.get(rid, False)
+            ]
+            active_node_count = sum(
+                rollout_to_graph_diagnostics[rid]["active_node_count"] for rid in positive_graph_rids
+            )
+            clipped_node_count = sum(
+                rollout_to_graph_diagnostics[rid]["clipped_node_count"] for rid in positive_graph_rids
+            )
+            branch_parent_count = sum(
+                rollout_to_graph_diagnostics[rid]["branch_parent_count"] for rid in positive_graph_rids
+            )
+            branch_parent_weight_sum = sum(
+                rollout_to_graph_diagnostics[rid]["branch_parent_weight_sum"] for rid in positive_graph_rids
+            )
+            echo_graph_metrics["clip_ratio"] = (
+                clipped_node_count / active_node_count if active_node_count > 0 else 0.0
+            )
+            echo_graph_metrics["branch_parent_weight_mean"] = (
+                branch_parent_weight_sum / branch_parent_count if branch_parent_count > 0 else 0.0
+            )
         return advantages, advantages
 
 

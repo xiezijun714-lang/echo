@@ -77,7 +77,23 @@ class Tracking:
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+            wandb_kwargs = {
+                "project": project_name,
+                "name": experiment_name,
+                "entity": entity,
+                "config": config,
+                "settings": settings,
+            }
+            # Explicitly pass the run identity so checkpoint continuation can
+            # append to the existing W&B history instead of creating a new run.
+            wandb_run_id = os.environ.get("WANDB_RUN_ID")
+            wandb_resume = os.environ.get("WANDB_RESUME")
+            if wandb_run_id:
+                wandb_kwargs["id"] = wandb_run_id
+                wandb_kwargs["resume"] = wandb_resume or "must"
+            elif wandb_resume:
+                wandb_kwargs["resume"] = wandb_resume
+            wandb.init(**wandb_kwargs)
             if os.environ.get("VERL_WANDB_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
                 run = wandb.run
                 run_settings = getattr(run, "settings", None)

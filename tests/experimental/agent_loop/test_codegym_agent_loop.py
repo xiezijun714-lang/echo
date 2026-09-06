@@ -34,6 +34,50 @@ def test_codegym_fc_parser_ignores_malformed_call():
     assert calls == []
 
 
+def test_hermes_parser_recovers_complete_call_without_closing_tag():
+    parser = ToolParser.get_tool_parser("hermes", DummyTokenizer())
+    raw_call = '{"name":"search","arguments":{"query":"echo"}}'
+
+    call = parser._recover_unclosed_call(raw_call)
+
+    assert call.name == "search"
+    assert json.loads(call.arguments) == {"query": "echo"}
+
+
+def test_hermes_parser_recovers_malformed_scalar_without_closing_tag():
+    parser = ToolParser.get_tool_parser("hermes", DummyTokenizer())
+    raw_call = '{"name":"finish","arguments":{"answer":"done"}'
+
+    call = parser._recover_unclosed_call(raw_call)
+
+    assert call.name == "finish"
+    assert json.loads(call.arguments) == {"answer": "done"}
+
+
+def test_hermes_parser_recovers_scalar_when_argument_comma_is_missing():
+    parser = ToolParser.get_tool_parser("hermes", DummyTokenizer())
+    raw_call = '{"name":"search","arguments":{"query":"echo" "topk":5}}'
+
+    call = parser._recover_malformed_call(raw_call)
+
+    assert call.name == "search"
+    assert json.loads(call.arguments) == {"query": "echo"}
+
+
+def test_hermes_parser_recovers_unclosed_call_after_partial_observation():
+    class FakeTokenizer:
+        def decode(self, _ids):
+            return 'reasoning\n<tool_call>{"name":"search","arguments":{"query":"echo"}}'
+
+    parser = ToolParser.get_tool_parser("hermes", FakeTokenizer())
+    content, calls = asyncio.run(parser.extract_tool_calls([1]))
+
+    assert content == "reasoning\n"
+    assert len(calls) == 1
+    assert calls[0].name == "search"
+    assert json.loads(calls[0].arguments) == {"query": "echo"}
+
+
 def test_codegym_client_strips_dataset_namespace_prefix():
     client = CodeGymClient(
         manager_host="http://127.0.0.1:8000",

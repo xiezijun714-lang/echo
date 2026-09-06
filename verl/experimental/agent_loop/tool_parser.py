@@ -88,7 +88,7 @@ class HermesToolParser(ToolParser):
     async def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[FunctionCall]]:
         loop = get_event_loop()
         text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
-        if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
+        if self.tool_call_start_token not in text:
             return text, []
 
         matches = self.tool_call_regex.findall(text)
@@ -99,12 +99,98 @@ class HermesToolParser(ToolParser):
                 name, arguments = function_call["name"], function_call["arguments"]
                 function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
             except Exception as e:
-                logger.error(f"Failed to decode tool call: {e}")
+                recovered = self._recover_malformed_call(match)
+                if recovered is not None:
+                    function_calls.append(recovered)
+                    logger.warning(f"Recovered malformed tool call: {e}")
+                else:
+                    logger.error(f"Failed to decode tool call: {e}")
 
-        # remaing text exclude tool call tokens
-        content = self.tool_call_regex.sub("", text)
+        # A response can hit the generation limit immediately after a complete
+        # JSON object and before emitting ``</tool_call>``.  Check for a
+        # trailing unmatched start token even when an earlier call was closed.
+        # Malformed/truncated payloads still return no call and follow the
+        # normal termination path.
+        content_text = text
+        trailing_start = text.rfind(self.tool_call_start_token)
+        trailing_end = text.rfind(self.tool_call_end_token)
+        if trailing_start > trailing_end:
+            recovered = self._recover_unclosed_call(text[trailing_start + len(self.tool_call_start_token) :])
+            if recovered is not None:
+                function_calls.append(recovered)
+                content_text = text[:trailing_start]
+                logger.warning("Recovered tool call without a closing </tool_call> tag.")
+
+        # remaining text excludes tool call tokens
+        content = self.tool_call_regex.sub("", content_text)
 
         return content, function_calls
+
+    @classmethod
+    def _recover_unclosed_call(cls, raw_call: str) -> FunctionCall | None:
+        """Recover a complete JSON payload whose closing XML tag is missing."""
+        payload = raw_call.strip()
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(payload)
+            if isinstance(parsed, dict) and parsed.get("name"):
+                arguments = parsed.get("arguments", {})
+                return FunctionCall(
+                    name=str(parsed["name"]),
+                    arguments=json.dumps(arguments, ensure_ascii=False),
+                )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return cls._recover_malformed_call(payload)
+
+    @staticmethod
+    def _recover_malformed_call(raw_call: str) -> FunctionCall | None:
+        """Recover simple calls when free-form text breaks nested JSON quoting.
+
+        Qwen occasionally emits an unescaped quote inside a search query or
+        finish explanation. The normal JSON path remains authoritative; this
+        fallback only accepts a known scalar parameter and leaves unknown
+        malformed calls untouched.
+        """
+        name_match = regex.search(r"[\"']name[\"']\s*:\s*[\"']([^\"']+)[\"']", raw_call)
+        if not name_match:
+            return None
+
+        name = name_match.group(1).strip()
+        parameter_names = {
+            "search": "query",
+            "open_page": "docid",
+            "finish": "answer",
+        }
+        parameter_name = parameter_names.get(name.lower())
+        if parameter_name is None:
+            return None
+
+        parameter_match = regex.search(
+            rf"[\"']{regex.escape(parameter_name)}[\"']\s*:\s*[\"']",
+            raw_call,
+            flags=regex.IGNORECASE,
+        )
+        if not parameter_match:
+            return None
+
+        value_start = parameter_match.end()
+        for quote_index in range(value_start, len(raw_call)):
+            if raw_call[quote_index] != '"' or (
+                quote_index > value_start and raw_call[quote_index - 1] == "\\"
+            ):
+                continue
+            suffix = raw_call[quote_index + 1 :]
+            # Accept a normal delimiter, the end of an unclosed payload, or a
+            # missing comma before the next JSON key. The latter is a frequent
+            # decoding failure for long Qwen tool arguments, e.g.
+            # ``"query":"..." "topk":5``.
+            if regex.match(r"\s*(?:,|}|$|[\"'][A-Za-z_][A-Za-z0-9_]*[\"']\s*:)", suffix):
+                value = raw_call[value_start:quote_index]
+                return FunctionCall(
+                    name=name,
+                    arguments=json.dumps({parameter_name: value}, ensure_ascii=False),
+                )
+        return None
 
 
 @ToolParser.register("codegym_fc")

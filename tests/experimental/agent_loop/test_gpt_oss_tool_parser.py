@@ -14,7 +14,7 @@
 import pytest
 from transformers import AutoTokenizer
 
-from verl.experimental.agent_loop.tool_parser import GptOssToolParser
+from verl.experimental.agent_loop.tool_parser import GptOssToolParser, HermesToolParser
 
 
 @pytest.mark.asyncio
@@ -32,3 +32,47 @@ async def test_gpt_oss_tool_parser():
     assert len(function_calls) == 1
     assert function_calls[0].name == "get_current_weather"
     assert function_calls[0].arguments == '{"location": "Tokyo"}'
+
+
+@pytest.mark.asyncio
+async def test_hermes_parser_recovers_unescaped_finish_explanation_quote():
+    class FakeTokenizer:
+        def decode(self, _ids):
+            return (
+                '<tool_call>\n'
+                '{"name": "finish", "arguments": {"answer": "Warren Beatty", '
+                '"explanation": "He appeared in "The Great Escape" (1963)."}}\n'
+                '</tool_call>'
+            )
+
+    _, function_calls = await HermesToolParser(FakeTokenizer()).extract_tool_calls([1])
+
+    assert len(function_calls) == 1
+    assert function_calls[0].name == "finish"
+    assert '"answer": "Warren Beatty"' in function_calls[0].arguments
+
+
+@pytest.mark.asyncio
+async def test_hermes_parser_keeps_normal_json_path():
+    class FakeTokenizer:
+        def decode(self, _ids):
+            return '<tool_call>{"name":"search","arguments":{"query":"echo"}}</tool_call>'
+
+    _, function_calls = await HermesToolParser(FakeTokenizer()).extract_tool_calls([1])
+
+    assert len(function_calls) == 1
+    assert function_calls[0].name == "search"
+    assert function_calls[0].arguments == '{"query": "echo"}'
+
+
+@pytest.mark.asyncio
+async def test_hermes_parser_recovers_unescaped_search_query_quote():
+    class FakeTokenizer:
+        def decode(self, _ids):
+            return '<tool_call>{"name":"search","arguments":{"query":"who said "hello"?"}}</tool_call>'
+
+    _, function_calls = await HermesToolParser(FakeTokenizer()).extract_tool_calls([1])
+
+    assert len(function_calls) == 1
+    assert function_calls[0].name == "search"
+    assert function_calls[0].arguments == '{"query": "who said \\"hello\\"?"}'

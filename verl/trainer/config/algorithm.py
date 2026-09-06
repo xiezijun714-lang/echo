@@ -604,7 +604,16 @@ class AlgoConfig(BaseConfig):
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
     echo_credit_method: str = "none"
-    echo_credit_penalty_ratio: Optional[float] = None
+    # Signed dense negative rollout update scale.
+    echo_neg_penalty_ratio: Optional[float] = None
+    # Typed ECHO graph credit assignment (used when echo_credit_method=graph).
+    # Set gamma_turn=1 for segment-level credit; values below 1 enable local
+    # turn-level decay. gamma_segment applies only across selection boundaries.
+    echo_graph_gamma_turn: float = 1.0
+    echo_graph_gamma_segment: float = 0.9
+    echo_graph_aggregation: str = "sum"
+    # Null disables clipping; positive values cap each node after aggregation.
+    echo_graph_clip_max: Optional[float] = 1.0
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

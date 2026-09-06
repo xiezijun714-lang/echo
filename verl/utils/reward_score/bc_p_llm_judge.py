@@ -77,29 +77,34 @@ def _extract_final_response(solution_str: str) -> str:
             payload = json.loads(tool_call)
         except Exception:
             continue
-        name = payload.get("name") or payload.get("function", {}).get("name")
-        if str(name).lower() != "finish":
-            continue
-        arguments = payload.get("arguments", {})
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except Exception:
-                arguments = {}
-        if not isinstance(arguments, dict):
-            continue
-        answer = arguments.get("answer", "")
-        explanation = arguments.get("explanation", "")
-        confidence = arguments.get("confidence", "")
-        parts = []
-        if explanation:
-            parts.append(f"Explanation: {explanation}")
-        if answer:
-            parts.append(f"Exact Answer: {answer}")
-        if confidence:
-            parts.append(f"Confidence: {confidence}")
-        if parts:
-            return "\n".join(parts)
+        payloads = payload if isinstance(payload, list) else [payload]
+        for payload in reversed(payloads):
+            if not isinstance(payload, dict):
+                continue
+            function = payload.get("function", {})
+            name = payload.get("name") or (function.get("name") if isinstance(function, dict) else None)
+            if str(name).lower() != "finish":
+                continue
+            arguments = payload.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except Exception:
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                continue
+            answer = arguments.get("answer", "")
+            explanation = arguments.get("explanation", "")
+            confidence = arguments.get("confidence", "")
+            parts = []
+            if explanation:
+                parts.append(f"Explanation: {explanation}")
+            if answer:
+                parts.append(f"Exact Answer: {answer}")
+            if confidence:
+                parts.append(f"Confidence: {confidence}")
+            if parts:
+                return "\n".join(parts)
 
     # Pattern 2: final report format. Preserve the report body, not just the
     # answer line, because the official judge sees the complete final output.
@@ -279,7 +284,7 @@ async def compute_score(
     judge_top_p: float = 1.0,
     **kwargs,
 ):
-    judge_model = os.getenv("BCP_JUDGE_MODEL", "Deepseek-V4-Flash")
+    judge_model = os.getenv("BCP_JUDGE_MODEL", "DeepSeek-V4-Flash")
     judge_api_base = os.getenv("BCP_JUDGE_API_BASE", "http://localhost:8000/v1")
     judge_api_key_env = os.getenv("BCP_JUDGE_API_KEY_ENV", "ONEAPI_KEY")
     judge_max_tokens = int(os.getenv("BCP_JUDGE_MAX_TOKENS", str(judge_max_tokens)))

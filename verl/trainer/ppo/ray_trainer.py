@@ -208,6 +208,7 @@ def compute_advantage(
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
+        echo_graph_metrics = None
         adv_kwargs = {
             "token_level_rewards": data.batch["token_level_rewards"],
             "response_mask": data.batch["response_mask"],
@@ -243,6 +244,8 @@ def compute_advantage(
                 adv_kwargs["echo_selected_traj_indices"] = data.non_tensor_batch["echo_selected_traj_indices"]
             if "echo_selected_turn_ids" in data.non_tensor_batch:
                 adv_kwargs["echo_selected_turn_ids"] = data.non_tensor_batch["echo_selected_turn_ids"]
+            if "echo_memory_graph" in data.non_tensor_batch:
+                adv_kwargs["echo_memory_graph"] = data.non_tensor_batch["echo_memory_graph"]
             if "echo_response_turn_ids" in data.non_tensor_batch:
                 adv_kwargs["echo_response_turn_ids"] = data.non_tensor_batch["echo_response_turn_ids"]
             if "echo_response_finding_turn_ids" in data.non_tensor_batch:
@@ -250,11 +253,15 @@ def compute_advantage(
             if "echo_response_selection_mask" in data.non_tensor_batch:
                 adv_kwargs["echo_response_selection_mask"] = data.non_tensor_batch["echo_response_selection_mask"]
             adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
+            echo_graph_metrics = {}
+            adv_kwargs["echo_graph_metrics"] = echo_graph_metrics
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        if echo_graph_metrics:
+            data.meta_info["echo_graph_metrics"] = echo_graph_metrics
     return data
 
 
@@ -743,6 +750,7 @@ class RayPPOTrainer:
         supo_expected_uid_data_source = {}
         supo_expected_uid_records = defaultdict(list)
         supo_final_uid_counts = defaultdict(int)
+        supo_echo_diagnostics = {}
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -820,6 +828,16 @@ class RayPPOTrainer:
             print("validation generation end")
             context_compressed_output = self._has_context_compression_metadata(test_output_gen_batch)
 
+            if self._is_supo:
+                rollout_ids = test_output_gen_batch.non_tensor_batch.get("rollout_id")
+                raw_diagnostics = test_output_gen_batch.non_tensor_batch.get("echo_diagnostics")
+                if rollout_ids is not None and raw_diagnostics is not None:
+                    for rid, raw_diag in zip(rollout_ids, raw_diagnostics, strict=False):
+                        while isinstance(raw_diag, np.ndarray) and raw_diag.ndim == 0:
+                            raw_diag = raw_diag.item()
+                        if isinstance(raw_diag, dict):
+                            supo_echo_diagnostics.setdefault(str(rid), raw_diag)
+
             # Log context-compressed rollout stats on the console only.
             if context_compressed_output:
                 self._log_supo_val_stats(test_output_gen_batch, test_batch, stage="post-rollout")
@@ -882,8 +900,16 @@ class RayPPOTrainer:
                     dump_extra_infos[k].extend(v)
                 else:
                     dump_extra_infos[k].append(v)
-            for k in ("uid", "ability", "code_id", "data_source", "is_final", "__num_turns__"):
+            for k in (
+                "uid", "ability", "code_id", "data_source", "is_final", "__num_turns__",
+                "rollout_id", "traj_idx", "overlong", "echo_diagnostics",
+            ):
                 if k in test_batch.non_tensor_batch:
+                    # Reward managers may already return is_final/overlong as
+                    # reward extras. Do not append the same column twice or
+                    # _dump_generations will reject it for length mismatch.
+                    if k in dump_extra_infos:
+                        continue
                     v = test_batch.non_tensor_batch[k]
                     if k not in dump_extra_infos:
                         dump_extra_infos[k] = []
@@ -1010,12 +1036,18 @@ class RayPPOTrainer:
             avg_splits = sum(traj_counts) / total_rollouts if total_rollouts > 0 else 1
             
             supo_stats = {
+                "supo_rollout_count": total_rollouts,
                 "supo_split_ratio": split_ratio,
                 "supo_max_splits": max_splits,
                 "supo_avg_splits": avg_splits,
                 "supo_missing_final_count": supo_missing_final_count,
                 "supo_missing_final_uid_count": supo_missing_final_uid_count,
             }
+
+        if self._is_supo:
+            # Validation outputs can contain multiple segments per rollout;
+            # deduplicate by rollout_id before reporting ECHO diagnostics.
+            supo_stats.update(self._aggregate_echo_diagnostic_values(list(supo_echo_diagnostics.values())))
 
         # dump generations (ALL trajectories for SUPO, final for non-SUPO)
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -1089,6 +1121,9 @@ class RayPPOTrainer:
     _SUPO_DUPLICATE_KEYS = [
         "uid", "data_source", "reward_model", "is_padding",
         "traj_idx", "is_final", "rollout_id", "overlong",
+        "echo_selected_traj_indices", "echo_selected_turn_ids", "echo_memory_graph",
+        "echo_response_turn_ids", "echo_response_finding_turn_ids", "echo_response_selection_mask",
+        "echo_diagnostics",
     ]
     _ROLLOUT_PASSTHROUGH_KEYS = ["uid", "data_source", "reward_model", "extra_info", "ability", "code_id", "is_padding"]
 
@@ -1108,6 +1143,157 @@ class RayPPOTrainer:
         """SUPO diagnostic logging for validation flow (console only, metrics are in supo_stats)."""
         pass
 
+    @staticmethod
+    def _aggregate_echo_diagnostic_values(
+        values: list[dict[str, Any]], prefix: str = ""
+    ) -> dict[str, float]:
+        """Aggregate one diagnostic dictionary per rollout.
+
+        ``prefix`` is empty for validation's local ``supo_stats`` mapping and
+        is a metric namespace for training metrics.
+        """
+        if not values:
+            return {}
+
+        name = f"{prefix}/" if prefix else ""
+        trigger_counts = [int(d.get("trigger_count", 0) or 0) for d in values]
+        trigger_lengths = [
+            int(length)
+            for d in values
+            for length in (d.get("trigger_lengths", []) or [])
+        ]
+        history_lengths = [
+            int(length)
+            for d in values
+            for length in (d.get("trigger_history_lengths", []) or [])
+        ]
+        selection_counts = [int(d.get("selection_count", 0) or 0) for d in values]
+        selection_parse_failures = sum(
+            int(d.get("selection_parse_failures", 0) or 0) for d in values
+        )
+        tool_parse_failures = sum(
+            int(d.get("tool_parse_failures", 0) or 0) for d in values
+        )
+        selection_response_lengths = [
+            int(length)
+            for d in values
+            for length in (d.get("selection_response_lengths", []) or [])
+        ]
+        reconstruction_prompt_lengths = [
+            int(length)
+            for d in values
+            for length in (d.get("reconstruction_prompt_lengths", []) or [])
+        ]
+        trigger_reasons = [
+            str(reason)
+            for d in values
+            for reason in (d.get("trigger_reasons", []) or [])
+        ]
+        count = len(values)
+        metrics = {
+            f"{name}echo_rollout_count": float(count),
+            f"{name}echo_trigger_rollout_ratio": sum(c > 0 for c in trigger_counts) / count,
+            f"{name}echo_trigger_count_mean": sum(trigger_counts) / count,
+            f"{name}echo_context_overflow_triggers": float(
+                sum(reason == "context_overflow" for reason in trigger_reasons)
+            ),
+            f"{name}echo_generation_length_triggers": float(
+                sum(reason == "generation_length" for reason in trigger_reasons)
+            ),
+            f"{name}echo_selection_count": float(sum(selection_counts)),
+            f"{name}echo_selection_parse_failures": float(selection_parse_failures),
+            f"{name}echo_tool_parse_failures": float(tool_parse_failures),
+            f"{name}echo_missing_finding_count": float(
+                sum(int(d.get("missing_finding_count", 0) or 0) for d in values)
+            ),
+            f"{name}echo_finish_before_threshold_ratio": sum(
+                int(d.get("finish_before_threshold_count", 0) or 0) > 0 for d in values
+            ) / count,
+            f"{name}echo_overlong_ratio": sum(bool(d.get("overlong", False)) for d in values) / count,
+            f"{name}echo_trajectory_count_mean": sum(
+                int(d.get("trajectory_count", 0) or 0) for d in values
+            ) / count,
+            f"{name}echo_prompt_budget_overflow_count": float(
+                sum(int(d.get("prompt_budget_overflow_count", 0) or 0) for d in values)
+            ),
+        }
+        if sum(selection_counts) > 0:
+            metrics[f"{name}echo_selection_parse_failure_ratio"] = (
+                selection_parse_failures / sum(selection_counts)
+            )
+        if selection_response_lengths:
+            metrics[f"{name}echo_selection_response_length_mean"] = (
+                sum(selection_response_lengths) / len(selection_response_lengths)
+            )
+        if trigger_lengths:
+            metrics[f"{name}echo_trigger_length_mean"] = sum(trigger_lengths) / len(trigger_lengths)
+            metrics[f"{name}echo_trigger_length_max"] = float(max(trigger_lengths))
+        if history_lengths:
+            metrics[f"{name}echo_trigger_history_mean"] = sum(history_lengths) / len(history_lengths)
+        if reconstruction_prompt_lengths:
+            metrics[f"{name}echo_reconstruction_prompt_length_mean"] = (
+                sum(reconstruction_prompt_lengths) / len(reconstruction_prompt_lengths)
+            )
+            metrics[f"{name}echo_reconstruction_prompt_length_max"] = float(max(reconstruction_prompt_lengths))
+        return metrics
+
+    @staticmethod
+    def _supo_diagnostic_metrics(gen_batch) -> dict[str, float]:
+        """Aggregate per-rollout ECHO diagnostics without counting segments twice."""
+        diagnostics = gen_batch.non_tensor_batch.get("echo_diagnostics")
+        rollout_ids = gen_batch.non_tensor_batch.get("rollout_id")
+        if diagnostics is None or rollout_ids is None:
+            return {}
+
+        def _unwrap(value):
+            while isinstance(value, np.ndarray) and value.ndim == 0:
+                value = value.item()
+            return value
+
+        per_rollout = {}
+        for rid, raw_diag in zip(rollout_ids, diagnostics, strict=False):
+            diag = _unwrap(raw_diag)
+            if not isinstance(diag, dict):
+                continue
+            per_rollout.setdefault(str(rid), diag)
+        return RayPPOTrainer._aggregate_echo_diagnostic_values(
+            list(per_rollout.values()), prefix="train/supo"
+        )
+
+    @staticmethod
+    def _merge_supo_stats(stats_a: dict[str, Any], stats_b: dict[str, Any]) -> dict[str, Any]:
+        """Merge validation SUPO/ECHO statistics from disjoint workers."""
+        stats_a = stats_a or {}
+        stats_b = stats_b or {}
+        merged_stats = {}
+        for key in set(stats_a) | set(stats_b):
+            left = stats_a.get(key)
+            right = stats_b.get(key)
+            if left is None:
+                merged_stats[key] = right
+                continue
+            if right is None:
+                merged_stats[key] = left
+                continue
+            if key.endswith("_max") or key in {"supo_max_splits"}:
+                merged_stats[key] = max(left, right)
+            elif key.endswith("_ratio") or key.endswith("_mean") or key == "supo_avg_splits":
+                left_weight = float(
+                    stats_a.get("supo_rollout_count", stats_a.get("echo_rollout_count", 0.0)) or 0.0
+                )
+                right_weight = float(
+                    stats_b.get("supo_rollout_count", stats_b.get("echo_rollout_count", 0.0)) or 0.0
+                )
+                total_weight = left_weight + right_weight
+                merged_stats[key] = (
+                    (left * left_weight + right * right_weight) / total_weight
+                    if total_weight > 0
+                    else (left + right) / 2.0
+                )
+            else:
+                merged_stats[key] = left + right
+        return merged_stats
+
     def _merge_validation_results(self, result_a, result_b):
         if result_a is None and result_b is None:
             return {}
@@ -1116,8 +1302,14 @@ class RayPPOTrainer:
         if result_b is None:
             result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
 
+        stats_a = result_a.get("supo_stats", {}) or {}
+        stats_b = result_b.get("supo_stats", {}) or {}
+
         if not result_a.get("data_sources") and not result_b.get("data_sources"):
-            return {}
+            return {
+                f"val-aux/supo/{key}": val
+                for key, val in self._merge_supo_stats(stats_a, stats_b).items()
+            }
 
         data_sources = np.concatenate(result_a["data_sources"] + result_b["data_sources"], axis=0)
         sample_uids = result_a["sample_uids"] + result_b["sample_uids"]
@@ -1132,7 +1324,14 @@ class RayPPOTrainer:
             list_b = result_b["reward_extra_infos_dict"].get(key, [None] * len_b)
             reward_extra_infos_dict[key] = list_a + list_b
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+        # Trainer and rollouter validate disjoint subsets in fully-async mode.
+        # Preserve SUPO/ECHO diagnostics when combining their result objects.
+        merged_stats = self._merge_supo_stats(stats_a, stats_b)
+        for key, value in merged_stats.items():
+            metric_dict[f"val-aux/supo/{key}"] = value
+        return metric_dict
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1434,8 +1633,20 @@ class RayPPOTrainer:
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+            # A checkpoint saved on the last batch of an epoch contains an
+            # exhausted sampler cursor.  Restoring that cursor while extending
+            # the epoch schedule makes the next epoch silently yield no batches.
+            # At an exact boundary the fresh loader is the correct starting
+            # point; preserve the state for mid-epoch resumes.
+            steps_per_epoch = len(self.train_dataloader)
+            if steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0:
+                print(
+                    "Checkpoint is at an epoch boundary; resetting the train "
+                    "dataloader state for continuation."
+                )
+            else:
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -1812,6 +2023,9 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                        if self._is_supo:
+                            metrics.update(self._supo_diagnostic_metrics(gen_batch_output))
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -2003,6 +2217,21 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        raw_graph_metrics = batch.meta_info.pop("echo_graph_metrics", {})
+                        if raw_graph_metrics:
+                            metrics.update(
+                                {
+                                    "train/supo/signed_advantage_mean": raw_graph_metrics.get(
+                                        "signed_advantage_mean", 0.0
+                                    ),
+                                    "train/supo/echo_graph_clip_ratio": raw_graph_metrics.get(
+                                        "clip_ratio", 0.0
+                                    ),
+                                    "train/supo/echo_graph_branch_parent_weight_mean": raw_graph_metrics.get(
+                                        "branch_parent_weight_mean", 0.0
+                                    ),
+                                }
+                            )
 
                     # update critic
                     if self.use_critic:
